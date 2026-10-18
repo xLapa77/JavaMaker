@@ -1,0 +1,69 @@
+name: Fabric Build
+run-name: build-${{ inputs.job_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      job_id: { required: true, type: string }
+      mc: { required: true, type: string }
+      jdk: { required: true, type: string }
+      gradle: { required: true, type: string }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      MC: ${{ inputs.mc }}
+    steps:
+      - name: Pobieranie projektu
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: jobs/${{ inputs.job_id }}.zip
+          sparse-checkout-cone-mode: false
+      - name: Rozpakowywanie
+        run: |
+          mkdir -p work && unzip -q "jobs/$JOB_ID.zip" -d work
+          f=$(find work -maxdepth 4 \( -name 'build.gradle' -o -name 'build.gradle.kts' \) | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+          if [ -z "$f" ]; then echo "::error::Brak build.gradle w archiwum"; exit 1; fi
+          echo "PROJ=$(dirname "$f")" >> $GITHUB_ENV
+      - name: Instalacja JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.jdk }}
+      - name: Instalacja Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ inputs.gradle }}
+      - name: Ustawianie wersji Minecrafta
+        working-directory: ${{ env.PROJ }}
+        run: |
+          P=gradle.properties
+          if [ -f $P ] && grep -q '^minecraft_version' $P; then
+            CUR=$(grep '^minecraft_version' $P | cut -d= -f2 | tr -d ' \r')
+            if [ "$CUR" != "$MC" ]; then
+              echo "Zmiana $CUR -> $MC"
+              YARN=$(curl -sf "https://meta.fabricmc.net/v2/versions/yarn/$MC" | jq -r '.[0].version // empty')
+              LOADER=$(curl -sf https://meta.fabricmc.net/v2/versions/loader | jq -r '[.[]|select(.stable)][0].version')
+              FAPI=$(curl -sf https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml | grep -oP "<version>\K[^<]*\+$MC(?=</version>)" | tail -1 || true)
+              sed -i "s/^minecraft_version=.*/minecraft_version=$MC/" $P
+              [ -n "$YARN" ] && sed -i "s/^yarn_mappings=.*/yarn_mappings=$YARN/" $P
+              [ -n "$LOADER" ] && sed -i "s/^loader_version=.*/loader_version=$LOADER/" $P
+              [ -n "$FAPI" ] && sed -i "s/^fabric_version=.*/fabric_version=$FAPI/" $P
+              cat $P
+            fi
+          fi
+      - name: Kompilacja
+        working-directory: ${{ env.PROJ }}
+        run: gradle build --no-daemon --stacktrace -x test
+      - name: Zbieranie pliku jar
+        working-directory: ${{ env.PROJ }}
+        run: |
+          mkdir -p out
+          find build/libs -name '*.jar' ! -name '*-sources.jar' ! -name '*-dev.jar' -exec cp {} out/ \;
+          ls out/*.jar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mod-jar
+          path: ${{ env.PROJ }}/out/*.jar
+          retention-days: 1
