@@ -1,31 +1,34 @@
-name: Fabric Build
-run-name: build-${{ inputs.job_id }}
+# fabric-builder v1
+name: fabric-build
+run-name: build ${{ inputs.job_id }}
 on:
   workflow_dispatch:
     inputs:
-      job_id: { required: true, type: string }
-      mc: { required: true, type: string }
-      jdk: { required: true, type: string }
-      gradle: { required: true, type: string }
+      job_id:
+        required: true
+      mc_version:
+        required: false
+        default: ""
+      jdk:
+        required: true
+      gradle:
+        required: true
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      JOB_ID: ${{ inputs.job_id }}
-      MC: ${{ inputs.mc }}
     steps:
-      - name: Pobieranie projektu
+      - name: Pobranie projektu
         uses: actions/checkout@v4
-        with:
-          sparse-checkout: jobs/${{ inputs.job_id }}.zip
-          sparse-checkout-cone-mode: false
-      - name: Rozpakowywanie
+      - name: Rozpakowanie archiwum
         run: |
-          mkdir -p work && unzip -q "jobs/$JOB_ID.zip" -d work
-          f=$(find work -maxdepth 4 \( -name 'build.gradle' -o -name 'build.gradle.kts' \) | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)
-          if [ -z "$f" ]; then echo "::error::Brak build.gradle w archiwum"; exit 1; fi
-          echo "PROJ=$(dirname "$f")" >> $GITHUB_ENV
+          mkdir -p /tmp/src
+          unzip -q job/source.zip -d /tmp/src || { echo "::error::Nie udało się rozpakować pliku .zip"; exit 1; }
+          F=$(find /tmp/src -maxdepth 5 \( -name settings.gradle -o -name settings.gradle.kts -o -name build.gradle -o -name build.gradle.kts \) -printf '%d %p\n' | sort -n | head -1 | cut -d' ' -f2-)
+          if [ -z "$F" ]; then echo "::error::W archiwum nie znaleziono build.gradle - to nie jest projekt Gradle"; exit 1; fi
+          ROOT=$(dirname "$F")
+          echo "Katalog projektu: $ROOT"
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
       - name: Instalacja JDK
         uses: actions/setup-java@v4
         with:
@@ -35,35 +38,45 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: ${{ inputs.gradle }}
-      - name: Ustawianie wersji Minecrafta
-        working-directory: ${{ env.PROJ }}
+      - name: Ustawienie wersji Minecrafta
+        if: inputs.mc_version != ''
+        env:
+          MC: ${{ inputs.mc_version }}
         run: |
-          P=gradle.properties
-          if [ -f $P ] && grep -q '^minecraft_version' $P; then
-            CUR=$(grep '^minecraft_version' $P | cut -d= -f2 | tr -d ' \r')
-            if [ "$CUR" != "$MC" ]; then
-              echo "Zmiana $CUR -> $MC"
-              YARN=$(curl -sf "https://meta.fabricmc.net/v2/versions/yarn/$MC" | jq -r '.[0].version // empty')
-              LOADER=$(curl -sf https://meta.fabricmc.net/v2/versions/loader | jq -r '[.[]|select(.stable)][0].version')
-              FAPI=$(curl -sf https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml | grep -oP "<version>\K[^<]*\+$MC(?=</version>)" | tail -1 || true)
-              sed -i "s/^minecraft_version=.*/minecraft_version=$MC/" $P
-              [ -n "$YARN" ] && sed -i "s/^yarn_mappings=.*/yarn_mappings=$YARN/" $P
-              [ -n "$LOADER" ] && sed -i "s/^loader_version=.*/loader_version=$LOADER/" $P
-              [ -n "$FAPI" ] && sed -i "s/^fabric_version=.*/fabric_version=$FAPI/" $P
-              cat $P
-            fi
-          fi
+          python3 - <<'PY'
+          import json, os, re, urllib.request
+          mc = os.environ["MC"]; root = os.environ["ROOT"]
+          def get(u):
+              return urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "fabric-builder"}), timeout=30).read().decode()
+          yarn = json.loads(get(f"https://meta.fabricmc.net/v2/versions/yarn/{mc}"))
+          if not yarn:
+              print(f"::error::Fabric nie obsługuje wersji Minecrafta {mc}"); raise SystemExit(1)
+          loader = next(l["version"] for l in json.loads(get("https://meta.fabricmc.net/v2/versions/loader")) if l.get("stable"))
+          meta = get("https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml")
+          api = [v for v in re.findall(r"<version>([^<]+)</version>", meta) if v.endswith("+" + mc)]
+          vals = {"minecraft_version": mc, "yarn_mappings": yarn[0]["version"], "loader_version": loader}
+          if api: vals["fabric_version"] = api[-1]; vals["fabric_api_version"] = api[-1]
+          p = os.path.join(root, "gradle.properties")
+          txt = open(p).read() if os.path.exists(p) else ""
+          for k, v in vals.items():
+              if re.search(rf"^{k}\s*=", txt, re.M):
+                  txt = re.sub(rf"^{k}\s*=.*$", f"{k}={v}", txt, flags=re.M)
+                  print(f"{k}={v}")
+          open(p, "w").write(txt)
+          PY
       - name: Kompilacja
-        working-directory: ${{ env.PROJ }}
-        run: gradle build --no-daemon --stacktrace -x test
-      - name: Zbieranie pliku jar
-        working-directory: ${{ env.PROJ }}
+        working-directory: ${{ env.ROOT }}
+        run: gradle build -x test --no-daemon --stacktrace
+      - name: Zebranie pliku .jar
+        working-directory: ${{ env.ROOT }}
         run: |
-          mkdir -p out
-          find build/libs -name '*.jar' ! -name '*-sources.jar' ! -name '*-dev.jar' -exec cp {} out/ \;
-          ls out/*.jar
-      - uses: actions/upload-artifact@v4
+          mkdir -p /tmp/out
+          find . -path '*/build/libs/*.jar' ! -name '*-sources.jar' ! -name '*-dev.jar' ! -name '*-javadoc.jar' -exec cp {} /tmp/out/ \;
+          if [ -z "$(ls -A /tmp/out)" ]; then echo "::error::Kompilacja nie wygenerowała pliku .jar"; exit 1; fi
+          ls -la /tmp/out
+      - name: Zapisanie wyniku
+        uses: actions/upload-artifact@v4
         with:
           name: mod-jar
-          path: ${{ env.PROJ }}/out/*.jar
+          path: /tmp/out/*.jar
           retention-days: 1
